@@ -7,6 +7,7 @@
 #include <cstring>
 #include <signal.h>
 #include <vector>
+#include <algorithm>
 
 struct SimulatedClock {
         unsigned int seconds;
@@ -50,6 +51,7 @@ int main(int argc, char **argv) {
 	int opt;
 	int current = 0;
 	int total = 0;
+	int totalLaunched = 0;
 	
 	signal(SIGALRM, signal_handler);
 	alarm(60);
@@ -118,19 +120,13 @@ int main(int argc, char **argv) {
 		}
 		
 		// Print process table every half a second
-		unsigned int elapsedPrintSec = clock->seconds - lastPrintSec;
-		unsigned int elapsedPrintNano;
+		unsigned int elapsedSec = clock->seconds - lastPrintSec;
+		unsigned int elapsedNano = (clock->nanoseconds >= lastPrintNano) ? clock->nanoseconds -
+			lastPrintNano : 1000000000 + clock->nanoseconds - lastPrintNano;
 		
-		if (clock->nanoseconds >= lastPrintNano) {
-			elapsedPrintNano = clock->nanoseconds - lastPrintNano;
-		} else {
-			elapsedPrintSec--;
-			elapsedPrintNano = 1000000000 + clock->nanoseconds - lastPrintNano;
-		}
-		
-		if (elapsedPrintSec > 0 || elapsedPrintNano >= 500000000) {
+		if (elapsedSec > 0 || elapsedNano >= 500000000) {
 			std::cout << "\nOSS Table at " << clock->seconds << ":"
-				<< clock->nanoseonds << "\n";
+				<< clock->nanoseconds << "\n";
 
 			for (int j = 0; j < total; j++) {
 				if (processTable[j].pid != 0) {
@@ -154,7 +150,7 @@ int main(int argc, char **argv) {
 				
 		// check terminated children
 		pid_t pid = waitpid(-1, &status, WNOHANG);
-		if (pid > 0) {
+		while (pid > 0) {
 			current--;
 			
 			for (int j = 0; j < total; j++) {
@@ -163,24 +159,27 @@ int main(int argc, char **argv) {
 					break;
 				}
 			}
+			childPids.erase(std::remove(childPids.begin(), childPids.end(), pid), childPids.end());
+
+			pid = waitpid(-1, &status, WNOHANG);
 		}
 
 		// check launch interval
 		unsigned int intervalSec = (unsigned int)i;
 		unsigned int intervalNano = (i - intervalSec) * 1000000000;
 
-		unsigned int elapsedSec = clock->seconds - lastLaunchSec;
-		unsigned int elapsedNano;
+		unsigned int elapsedLaunchSec = clock->seconds - lastLaunchSec;
+		unsigned int elapsedLaunchNano;
 		if (clock->nanoseconds >= lastLaunchNano) {
-			elapsedNano = clock->nanoseconds - lastLaunchNano;
+			elapsedLaunchNano = clock->nanoseconds - lastLaunchNano;
 		} else {
-			elapsedSec--;
-			elapsedNano = 1000000000 + clock->nanoseconds - lastLaunchNano;
+			elapsedLaunchSec--;
+			elapsedLaunchNano = 1000000000 + clock->nanoseconds - lastLaunchNano;
 		}
 
 		bool intervalPassed =
-			(elapsedSec > intervalSec) ||
-			(elapsedSec == intervalSec && elapsedNano >= intervalNano);
+			(elapsedLaunchSec > intervalSec) ||
+			(elapsedLaunchSec == intervalSec && elapsedNano >= intervalNano);
 
 		// Launch new child
 		if (!stopLaunching && current < s && total < n && intervalPassed) {
@@ -188,19 +187,30 @@ int main(int argc, char **argv) {
 			pid_t childPid = fork();
 		
 			if (childPid == 0) {
-				execl("./worker", "worker", secStr, nanoStr, NULL);
+				execl("./worker", "worker", "1", "0", NULL);
+				perror("execl failed");
 				exit(1);
 			}
 
 			if (childPid > 0) {
 				childPids.push_back(childPid);
-
-				processTable[total].pid = childPid;
-				processTable[total].startSec = clock->seconds;
-				processTable[total].startNano = clock->nanoseconds;
-
 				current++;
-                                total++;
+				totalLaunched++;
+				
+				int slot = -1;
+				
+				for (int j = 0; j < 100; j++) {
+					if (processTable[j].pid == 0) {
+						slot = j;
+						break;
+					}
+				}
+				
+				if (slot != -1) {
+					processTable[slot].pid = childPid;
+					processTable[slot].startSec = clock->seconds;
+					processTable[slot].startNano = clock->nanoseconds;
+				}
 
 				lastLaunchSec = clock->seconds;
 				lastLaunchNano = clock->nanoseconds;
@@ -212,7 +222,7 @@ int main(int argc, char **argv) {
 	while (wait(NULL) > 0);
 
 	std::cout << "OSS terminating\n";
-	std::cout << total << " workers were launched\n";
+	std::cout << totalLaunched << " workers were launched\n";
 
 	shmdt(clock);
 	shmctl(shmid, IPC_RMID, NULL);
