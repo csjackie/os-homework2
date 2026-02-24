@@ -5,112 +5,150 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <cstring>
+#include <signal.h>
+#include <vector>
 
 struct SimulatedClock {
-	unsigned int seconds;
-	unsigned int nanoseconds;
+        unsigned int seconds;
+        unsigned int nanoseconds;
 };
+
+struct PCB {
+        pid_t pid;
+        unsigned int startSec;
+        unsigned int startNano;
+};
+
+std::vector<pid_t> childPids;
+int shmid_global;
+SimulatedClock* clock_global = nullptr;
+
+void signal_handler(int sig) {
+
+	std::cerr << "\nOSS: Timeout reached. Killing children...\n";
+	
+	for (pid_t pid : childPids) {
+		kill(pid, SIGTERM);
+	}
+
+	if (clock_global)
+		shmdt(clock_global);
+
+	if (shmid_global > 0)
+		shmctl(shmid_global, IPC_RMID, NULL);
+	
+	exit(1);
+}
 
 int main(int argc, char **argv) {
 
-	// sets default of n, s, t, and i to 1 if value not given
         int n = 1;
 	int s = 1;
 	float t = 1;
 	float i = 1;
 	
-	// initializing opt
 	int opt;
-	// accumulator to track current child processes being completed, set at 0
 	int current = 0;
-	// accumulator to track the total number of child processes launched, set at 0
 	int total = 0;
+	
+	signal(SIGALRM, signal_handler);
+	alarm(60);
 
-	// getopt(3) parses options
 	while ((opt = getopt(argc, argv, "hn:s:t:i:")) != -1) {
 		switch (opt) {
-			// outputs a help message explaining how to run the program, then exits
 			case 'h':
 				std::cout << "To run program:\n\t ./oss -n # -s # -t # -i #\n";
 				std::cout << "Replace # with an integer for n and s, and a float of t and i.\n";
 				return 0;
-			// number of total child processes
-			case 'n':
-				// converts the string input for n to int and assigns it to n
-				n = atoi(optarg);
-				break;
-			// number of allowed simultaneous child processes running at one time
-			case 's':
-				// converts the string input for s to int and assigns it to s
-				s = atoi(optarg);
-				break;
-			// amount of simulated time
-			case 't':
-				// converts the string input for t to int and assigns it to t
-				t = atof(optarg);
-				break;
-			// minimum interval between launching child processes
-			case 'i':
-				// converts the float input for i to float and assigns it to i
-				i = atof(optarg);
-				break;
+			case 'n': n = atoi(optarg); break;
+			case 's': s = atoi(optarg); break;
+			case 't': t = atof(optarg); break;
+			case 'i': i = atof(optarg); break;
 		}
 	}
 
 	// prints error message and exits program if the value of n, s, or t are out of range
-	if (n <= 0 || n > 100) {
-		std::cout << "Invalid value for n\n";
-		exit(1);
-	}
-
-	if (s <= 0 || s > 15) {
-		std::cout << "Invalid value for s\n";
-		exit(1);
-	}
-
-	if (t <= 0){
-		std::cout << "Invalid value for t\n";
-		exit(1);
-	}
-
-	if (i < 0) {
-		std::cout << "Invalid value for i\n";
-		exit(1);
-	}
-	if (s > n){
+	if (n <= 0 || n > 100 || s <= 0 || s > 15 || t <= 0 || i < 0 || s > n) {
+		std::cout << "Invalid argument values\n";
 		exit(1);
 	}
 
 	// Shared memory setup
 	key_t key = ftok(".", 'x');
 	int shmid = shmget(key, sizeof(SimulatedClock), IPC_CREAT | 0666);
+	if (shmid < 0) {
+		perror("shmget failed");
+		exit(1);
+	}
+
 	SimulatedClock* clock = (SimulatedClock*) shmat(shmid, NULL, 0);
+	
+	if (clock == (void*) -1) {
+		perror("shmat failed");
+		exit(1);
+	}
+	
+	shmid_global = shmid;
+	clock_global = clock;
 
 	clock->seconds = 0;
 	clock->nanoseconds = 0;
+	
+	PCB processTable[100] = {0};
 
 	unsigned int lastLaunchSec = 0;
 	unsigned int lastLaunchNano = 0;
+	unsigned int lastPrintSec = 0;
+        unsigned int lastPrintNano = 0;
 
 	unsigned int timeLimitSec = (unsigned int)t;
 	unsigned int timeLimitNano = (t - timeLimitSec) * 1000000000;
-
-	int status;
 	
+	int status;
 	bool stopLaunching = false;
 
-	while (total < n || current > 0) {
-		//incrementClock();
+	while (!stopLaunching || current > 0) {
+	
+		// Increment simulated clock
 		clock->nanoseconds += 10000000;
 		
 		if (clock->nanoseconds >= 1000000000) {
 			clock->seconds++;
-			clock->nanoseconds -= 100000000;
+			clock->nanoseconds -= 1000000000;
 		}
-		// check simulated time limit
+		
+		// Print process table every half a second
+		unsigned int elapsedPrintSec = clock->seconds - lastPrintSec;
+		unsigned int elapsedPrintNano;
+		
+		if (clock->nanoseconds >= lastPrintNano) {
+			elapsedPrintNano = clock->nanoseconds - lastPrintNano;
+		} else {
+			elapsedPrintSec--;
+			elapsedPrintNano = 1000000000 + clock->nanoseconds - lastPrintNano;
+		}
+		
+		if (elapsedPrintSec > 0 || elapsedPrintNano >= 500000000) {
+			std::cout << "\nOSS Table at " << clock->seconds << ":"
+				<< clock->nanoseonds << "\n";
+
+			for (int j = 0; j < total; j++) {
+				if (processTable[j].pid != 0) {
+					std::cout << "PID: " << processTable[j].pid << " Start: "
+						<< processTable[j].startSec << ":"
+						<< processTable[j].startNano << "\n";
+				}
+			}
+
+			lastPrintSec = clock->seconds;
+			lastPrintNano = clock->nanoseconds;
+		}
+
+		// Check simulated time
 		if (clock->seconds > timeLimitSec ||
-				(clock->seconds == timeLimitSec &&
+				(clock->seconds == timeLimitSec && 
 				 clock->nanoseconds >= timeLimitNano)){
+			
 			stopLaunching = true;
 		}
 				
@@ -118,50 +156,58 @@ int main(int argc, char **argv) {
 		pid_t pid = waitpid(-1, &status, WNOHANG);
 		if (pid > 0) {
 			current--;
-			// clear PCB entry
+			
+			for (int j = 0; j < total; j++) {
+				if (processTable[j].pid == pid) {
+					processTable[j].pid = 0;
+					break;
+				}
+			}
 		}
+
 		// check launch interval
 		unsigned int intervalSec = (unsigned int)i;
 		unsigned int intervalNano = (i - intervalSec) * 1000000000;
 
 		unsigned int elapsedSec = clock->seconds - lastLaunchSec;
 		unsigned int elapsedNano;
-
 		if (clock->nanoseconds >= lastLaunchNano) {
 			elapsedNano = clock->nanoseconds - lastLaunchNano;
 		} else {
 			elapsedSec--;
 			elapsedNano = 1000000000 + clock->nanoseconds - lastLaunchNano;
 		}
+
 		bool intervalPassed =
 			(elapsedSec > intervalSec) ||
 			(elapsedSec == intervalSec && elapsedNano >= intervalNano);
 
-		// possibly launch new child
+		// Launch new child
 		if (!stopLaunching && current < s && total < n && intervalPassed) {
 
 			pid_t childPid = fork();
-
+		
 			if (childPid == 0) {
-				char secStr[10];
-				char nanoStr[10];
-
-				sprintf(secStr, "%d", 1);
-				sprintf(nanoStr, "%d", 0);
-
 				execl("./worker", "worker", secStr, nanoStr, NULL);
 				exit(1);
 			}
 
 			if (childPid > 0) {
+				childPids.push_back(childPid);
+
+				processTable[total].pid = childPid;
+				processTable[total].startSec = clock->seconds;
+				processTable[total].startNano = clock->nanoseconds;
+
 				current++;
-				total++;
+                                total++;
 
 				lastLaunchSec = clock->seconds;
 				lastLaunchNano = clock->nanoseconds;
 			}
 		}
 	}
+
 	// wait for remaining children
 	while (wait(NULL) > 0);
 
